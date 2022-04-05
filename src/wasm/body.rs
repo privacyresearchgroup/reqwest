@@ -6,6 +6,9 @@ use js_sys::Uint8Array;
 use std::fmt;
 use wasm_bindgen::JsValue;
 
+#[cfg(feature = "stream")]
+use wasm_streams::readable::ReadableStream;
+
 /// The body of a `Request`.
 ///
 /// In most cases, this is not needed directly, as the
@@ -25,6 +28,9 @@ enum Inner {
     /// MultipartPart holds the body of a multipart/form-data part.
     #[cfg(feature = "multipart")]
     MultipartPart(Bytes),
+    /// Streaming body contain a ReadableStream
+    #[cfg(feature = "stream")]
+    Streaming(ReadableStream),
 }
 
 impl Body {
@@ -39,6 +45,8 @@ impl Body {
             Inner::MultipartForm(_) => None,
             #[cfg(feature = "multipart")]
             Inner::MultipartPart(bytes) => Some(bytes.as_ref()),
+            #[cfg(feature = "stream")]
+            Inner::Streaming(_) => None,
         }
     }
     pub(crate) fn to_js_value(&self) -> crate::Result<JsValue> {
@@ -62,6 +70,12 @@ impl Body {
                 let body_array = js_sys::Array::new();
                 body_array.push(&body_uint8_array);
                 let js_value: &JsValue = body_array.as_ref();
+                Ok(js_value.to_owned())
+            }
+            #[cfg(feature = "stream")]
+            Inner::Streaming(readable_stream) => {
+                let js_value: &JsValue = readable_stream.as_raw().as_ref();
+
                 Ok(js_value.to_owned())
             }
         }
@@ -88,6 +102,10 @@ impl Body {
             Inner::MultipartPart(bytes) => Self {
                 inner: Inner::MultipartPart(bytes),
             },
+            #[cfg(feature = "stream")]
+            Inner::Streaming(readable_stream) => Self {
+                inner: Inner::Streaming(readable_stream)
+            }
         }
     }
 
@@ -98,6 +116,8 @@ impl Body {
             Inner::MultipartForm(form) => form.is_empty(),
             #[cfg(feature = "multipart")]
             Inner::MultipartPart(bytes) => bytes.is_empty(),
+            #[cfg(feature = "stream")]
+            Inner::Streaming(_) => false,
         }
     }
 
@@ -112,6 +132,18 @@ impl Body {
             Inner::MultipartPart(bytes) => Some(Self {
                 inner: Inner::MultipartPart(bytes.clone()),
             }),
+            #[cfg(feature = "stream")]
+            Inner::Streaming(_) => None,
+        }
+    }
+}
+
+#[cfg(feature = "stream")]
+impl From<ReadableStream> for Body {
+    #[inline]
+    fn from(readable_stream: ReadableStream) -> Body {
+        Body {
+            inner: Inner::Streaming(readable_stream),
         }
     }
 }
@@ -172,6 +204,7 @@ mod tests {
     use wasm_bindgen::prelude::*;
     use wasm_bindgen_test::*;
 
+    
     wasm_bindgen_test::wasm_bindgen_test_configure!(run_in_browser);
 
     #[wasm_bindgen]
@@ -287,5 +320,63 @@ mod tests {
         let v = Uint8Array::new(&array_buffer).to_vec();
 
         assert_eq!(v, body_value);
+    }
+
+    #[wasm_bindgen_test]
+    async fn test_body_js_stream() {
+        use futures_util::StreamExt;
+        use wasm_bindgen::JsCast;
+        use wasm_streams::readable::ReadableStream;
+        use web_sys::Blob;
+        use js_sys::Array;
+
+        let in_data = b"Hello World!";
+
+        let u8_array = Uint8Array::new_with_length(in_data.len() as u32);
+        u8_array.copy_from(in_data);
+
+        let array = Array::new();
+        array.push(&u8_array);
+        let blob = Blob::new_with_u8_array_sequence(&array).expect("Blob Construction");
+    
+        let stream = ReadableStream::from_raw(blob.stream().unchecked_into());
+
+        let body = Body::from(stream);
+
+        let mut init = web_sys::RequestInit::new();
+        init.method("POST");
+        init.body(Some(
+            body.to_js_value()
+                .expect("could not convert body to JsValue")
+                .as_ref(),
+        ));
+
+        let js_req = web_sys::Request::new_with_str_and_init("", &init)
+            .expect("could not create JS request");
+
+        let body = js_req.body().expect("Browser support ReadableStream");
+        let stream = ReadableStream::from_raw(body.unchecked_into());
+
+        let out_stream = stream.into_stream().map(|buf_js| -> crate::Result<Vec<u8>>{
+            let buffer = Uint8Array::new(
+                &buf_js
+                    .map_err(crate::error::wasm)
+                    .map_err(crate::error::decode)?,
+            );
+            let mut bytes = vec![0; buffer.length() as usize];
+            buffer.copy_to(&mut bytes);
+            Ok(bytes)
+        });
+
+        let out_data: Vec<Vec<u8>> = out_stream.filter_map(|item| async move {
+            match item {
+                Ok(bytes) => Some(bytes),
+                Err(_) => None,
+            }
+        }).collect().await;
+
+        let out_data: Vec<u8> = out_data.into_iter().flatten().collect();
+
+        assert_eq!(out_data, in_data);
     }
 }
